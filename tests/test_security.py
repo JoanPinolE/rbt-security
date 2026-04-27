@@ -4,7 +4,7 @@ tests/test_security.py
 Comprehensive test suite covering:
   - Basic API functionality
   - Risk Score rule engine
-  - ML bot detection
+  - ML botardos detection
   - False positive handling
   - Prometheus metrics
 
