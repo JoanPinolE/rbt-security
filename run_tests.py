@@ -1,232 +1,313 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-run_tests.py — Master runner actualizado con todas las suites
-─────────────────────────────────────────────────────────────
+run_tests.py  --  Master Test Runner for RBT Security
+======================================================
 
-Suites disponibles:
-  unit        → test_unit.py       (tests originales)
-  unit-deep   → test_unit_deep.py  (funciones internas + ML unit)
-  integration → test_integration.py (FastAPI ↔ Redis ↔ ML ↔ Prometheus)
-  security    → test_security.py   (Risk Score, autenticación, falsos positivos)
-  advanced    → test_advanced.py   (contrato API, chaos, concurrencia, boundary)
-  pentest     → test_penetration.py (SQL, XSS, fuerza bruta, evasión)
-  load        → test_load.py       (rendimiento, concurrencia, carga sostenida)
-  e2e         → test_e2e.py        (journeys completos, Grafana, Prometheus)
-  ai          → test_ai.py         (calidad ML, robustez, fairness, explainability)
-  all         → todas las suites
+Run with PYTHON, not pytest:
+    python run_tests.py              # default: security + advanced + integration
+    python run_tests.py --all        # every suite
+    python run_tests.py --all --no-soak   # every suite, skip 2-min soak
+    python run_tests.py --load       # load & performance only
+    python run_tests.py --pentest    # penetration only
+    python run_tests.py --e2e        # end-to-end only
+    python run_tests.py --no-api     # unit + ai without Docker
+    python run_tests.py --all --report    # all + HTML reports in reports/
+    python run_tests.py --grafana    # generate Grafana traffic
 
-Uso:
-    python run_tests.py                    → security + advanced + integration
-    python run_tests.py --unit             → tests sin API
-    python run_tests.py --unit-deep        → tests unitarios profundos
-    python run_tests.py --integration      → integración de componentes
-    python run_tests.py --ai               → pruebas de IA/ML
-    python run_tests.py --pentest          → penetración
-    python run_tests.py --load             → carga (sin test sostenido)
-    python run_tests.py --e2e              → end-to-end
-    python run_tests.py --all              → todo
-    python run_tests.py --quick            → solo tests rápidos
-    python run_tests.py --grafana          → genera datos para Grafana
-    python run_tests.py --no-api           → solo tests sin API (unit + unit-deep + ai-unit)
+WRONG: pytest run_tests.py   (has no test_ functions -- 0 items collected)
+RIGHT: python run_tests.py
 """
 
+import argparse
+import json
+import os
 import subprocess
 import sys
-import argparse
 import time
-import os
+import urllib.request
+from pathlib import Path
 
-BASE = "http://localhost:8000"
+BASE       = "http://localhost:8000"
+PROMETHEUS = "http://localhost:9090"
+GRAFANA    = "http://localhost:3000"
 
-
-def _check(url, name, timeout=5):
-    import urllib.request
+# Force UTF-8 output on Windows so print() works everywhere
+if sys.platform == "win32":
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+    # Enable ANSI color support in Windows 10+ console
     try:
-        urllib.request.urlopen(url, timeout=timeout)
-        print(f"  ✅ {name}: OK")
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleMode(
+            ctypes.windll.kernel32.GetStdHandle(-11), 7)
+    except Exception:
+        pass
+
+G  = "\033[92m"   # green
+R  = "\033[91m"   # red
+Y  = "\033[93m"   # yellow
+C  = "\033[96m"   # cyan
+B  = "\033[1m"    # bold
+RS = "\033[0m"    # reset
+
+
+# =====================================================================
+# SERVICE CHECKS
+# =====================================================================
+def reachable(url):
+    try:
+        urllib.request.urlopen(url, timeout=4)
         return True
     except Exception:
-        print(f"  ❌ {name}: no responde")
         return False
 
 
 def check_services():
-    import urllib.request, json
-    print("\nVerificando servicios...")
-    api_ok = _check(f"{BASE}/", "FastAPI")
-    _check("http://localhost:9090/-/healthy", "Prometheus")
-    _check("http://localhost:3000/api/health", "Grafana")
+    print(f"\n{C}Checking services...{RS}")
+    api  = reachable(f"{BASE}/")
+    prom = reachable(f"{PROMETHEUS}/-/healthy")
+    graf = reachable(f"{GRAFANA}/api/health")
 
-    if api_ok:
+    tag = lambda ok: f"{G}UP {RS}" if ok else f"{R}-- {RS}"
+    print(f"  {tag(api)}  FastAPI    http://localhost:8000")
+    print(f"  {tag(prom)}  Prometheus http://localhost:9090")
+    print(f"  {tag(graf)}  Grafana    http://localhost:3000")
+
+    if api:
         try:
-            data = json.loads(
-                urllib.request.urlopen(f"{BASE}/status", timeout=5).read()
-            )
-            ml = data.get("ml_model_loaded", False)
-            print(f"  {'✅' if ml else '⚠️ '} ML Model: {'cargado' if ml else 'NO cargado'}")
+            d = json.loads(urllib.request.urlopen(f"{BASE}/status", timeout=4).read())
+            ml = d.get("ml_model_loaded", False)
+            ml_tag = f"{G}loaded{RS}" if ml else f"{Y}NOT loaded -- docker compose up --build -d{RS}"
+            print(f"  {'OK ' if ml else 'WRN'}  ML Model   {ml_tag}")
         except Exception:
             pass
-    return api_ok
+    print()
+    return api, prom, graf
 
 
-def run_pytest(args_list, label):
-    print(f"\n{'═'*60}")
-    print(f"  {label}")
-    print(f"{'═'*60}\n")
-    os.makedirs("reports", exist_ok=True)
-    cmd = [sys.executable, "-m", "pytest"] + args_list
-    result = subprocess.run(cmd)
-    return result.returncode == 0
+# =====================================================================
+# PYTEST RUNNER
+# =====================================================================
+def run_pytest(paths, label, extra_args=None, report_name=None):
+    print(f"\n{B}{C}{'=' * 60}{RS}")
+    print(f"{B}  {label}{RS}")
+    print(f"{B}{C}{'=' * 60}{RS}\n")
+
+    cmd = [sys.executable, "-m", "pytest"] + paths + ["-v", "--tb=short"]
+
+    if report_name:
+        os.makedirs("reports", exist_ok=True)
+        cmd += [f"--html=reports/{report_name}.html", "--self-contained-html"]
+
+    if extra_args:
+        cmd += extra_args
+
+    print(f"  {C}CMD:{RS} {' '.join(cmd)}\n")
+    return subprocess.run(cmd).returncode == 0
 
 
+# =====================================================================
+# MAIN
+# =====================================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="🛡 RBT Security — Master Test Runner",
+        prog="python run_tests.py",
+        description="RBT Security -- Master Test Runner",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python run_tests.py                   (default: security + advanced + integration)
+  python run_tests.py --all             (every suite)
+  python run_tests.py --all --no-soak   (skip the 2-min soak test)
+  python run_tests.py --load --report   (load tests + HTML report)
+  python run_tests.py --pentest         (penetration tests only)
+  python run_tests.py --e2e             (end-to-end only)
+  python run_tests.py --no-api          (unit + ai, no Docker needed)
+
+WRONG: pytest run_tests.py
+RIGHT: python run_tests.py
+        """,
     )
-    parser.add_argument("--unit",        action="store_true", help="Unit tests originales (test_unit.py)")
-    parser.add_argument("--unit-deep",   action="store_true", help="Unit tests profundos (test_unit_deep.py)")
-    parser.add_argument("--integration", action="store_true", help="Integration tests (FastAPI↔Redis↔ML↔Prometheus)")
-    parser.add_argument("--security",    action="store_true", help="Security tests (test_security.py)")
-    parser.add_argument("--advanced",    action="store_true", help="Advanced tests (contrato API, chaos, boundary)")
-    parser.add_argument("--pentest",     action="store_true", help="Penetration tests (SQL, XSS, brute force)")
-    parser.add_argument("--load",        action="store_true", help="Load tests (sin test sostenido)")
+
+    # -- Suite flags --
+    parser.add_argument("--unit",        action="store_true", help="Unit tests (no API)")
+    parser.add_argument("--security",    action="store_true", help="Security tests")
+    parser.add_argument("--advanced",    action="store_true", help="Advanced tests")
+    parser.add_argument("--integration", action="store_true", help="Integration tests")
+    parser.add_argument("--load",        action="store_true", help="Load & performance")
+    parser.add_argument("--pentest",     action="store_true", help="Penetration tests")
     parser.add_argument("--e2e",         action="store_true", help="End-to-end tests")
-    parser.add_argument("--ai",          action="store_true", help="AI/ML tests (calidad, fairness, robustez)")
-    parser.add_argument("--all",         action="store_true", help="Todas las suites")
-    parser.add_argument("--quick",       action="store_true", help="Solo tests rápidos (sin load/e2e)")
-    parser.add_argument("--no-api",      action="store_true", help="Solo tests sin API (unit + unit-deep + ai sin live)")
-    parser.add_argument("--grafana",     action="store_true", help="Generar datos para Grafana")
+    parser.add_argument("--scraping",    action="store_true", help="Scraping & metrics")
+    parser.add_argument("--ai",          action="store_true", help="AI/ML tests")
+
+    # -- Presets --
+    parser.add_argument("--all",    action="store_true", help="All API-dependent suites")
+    parser.add_argument("--quick",  action="store_true", help="security + advanced + integration")
+    parser.add_argument("--no-api", action="store_true", help="unit + ai (no Docker)")
+
+    # -- Options --
+    parser.add_argument("--no-soak", action="store_true",
+                        help="Skip the 2-min soak test")
+    parser.add_argument("--report",  action="store_true",
+                        help="Generate HTML reports in reports/")
+    parser.add_argument("--grafana", action="store_true",
+                        help="Generate traffic to populate Grafana panels")
+
     args = parser.parse_args()
 
-    nothing_selected = not any(vars(args).values())
+    print(f"\n{B}RBT Security -- Master Test Runner{RS}")
+    print("-" * 60)
+    print(f"  Python  : {sys.version.split()[0]}")
+    print(f"  Platform: {sys.platform}")
+    print(f"  Dir     : {Path.cwd()}")
 
-    print("\n🛡  RBT Security — Master Test Runner")
-    print("━" * 60)
+    api_ok, prom_ok, graf_ok = check_services()
 
-    # Para tests sin API
-    if args.no_api:
-        api_ok = False
-        print("\n⚙️  Modo sin API — solo tests en aislamiento")
-    else:
-        api_ok = check_services()
-        if not api_ok and not args.unit and not args.unit_deep and not args.ai:
-            print("\n❌ API no disponible. Ejecuta: docker compose up -d")
-            print("   O usa: python run_tests.py --no-api")
-            sys.exit(1)
+    # Default to --quick when nothing is selected
+    nothing = not any([
+        args.unit, args.security, args.advanced, args.integration,
+        args.load, args.pentest, args.e2e, args.scraping, args.ai,
+        args.all, args.quick, args.no_api, args.grafana,
+    ])
+    if nothing:
+        print(f"{Y}No suite selected -- running --quick{RS}")
+        args.quick = True
+
+    # Must have API for most suites
+    if not api_ok and not args.no_api and not args.unit and not args.ai:
+        print(f"{R}API not reachable at http://localhost:8000{RS}")
+        print("  Start with: docker compose up -d")
+        print("  Or run:     python run_tests.py --no-api")
+        sys.exit(1)
 
     results = {}
-    start   = time.time()
+    t0 = time.time()
 
-    # ── Unit Tests (originales) ───────────────────────────────
-    if args.unit or args.all or args.no_api or nothing_selected:
-        try:
-            from ml.train_model import generate_training_data
-        except Exception:
-            subprocess.run([sys.executable, "ml/train_model.py"], check=False)
+    # --no-soak skips the 2-min sustained load test by its method name
+    no_soak = ["-k", "not sustained_2_minutes"] if args.no_soak else []
 
-        ok = run_pytest([
-            "tests/test_unit.py", "-v", "--tb=short",
-            "--html=reports/unit_report.html", "--self-contained-html"
-        ], "UNIT TESTS — funciones internas con mocks")
-        results["Unit (original)"] = ok
+    def suite(flag, paths, label, extra=None, report=None):
+        if not flag:
+            return
+        # Skip missing files gracefully
+        found = [p for p in paths if Path(p.split("::")[0]).exists()]
+        if not found:
+            print(f"{Y}  SKIP  {label} -- files not found{RS}")
+            results[label] = None
+            return
+        # Check API availability
+        needs_api = not any("unit" in p or "ai" in p for p in paths)
+        if needs_api and not api_ok:
+            print(f"{Y}  SKIP  {label} -- API not available{RS}")
+            results[label] = None
+            return
+        rep = report if args.report else None
+        results[label] = run_pytest(
+            found, label,
+            extra_args=(extra or []) + no_soak,
+            report_name=rep,
+        )
 
-    # ── Unit Tests Deep ───────────────────────────────────────
-    if args.unit_deep or args.all or args.no_api:
-        ok = run_pytest([
-            "tests/test_unit_deep.py", "-v", "--tb=short",
-            "--html=reports/unit_deep_report.html", "--self-contained-html"
-        ], "UNIT TESTS DEEP — get_fingerprint, extract_features, update_risk_score, ML")
-        results["Unit Deep"] = ok
+    # -- Unit (no API) -----------------------------------------------------
+    unit_files = [p for p in [
+        "tests/test_unit.py", "tests/test_unit_deep.py"
+    ] if Path(p).exists()]
+    suite(args.unit or args.all or args.no_api,
+          unit_files or ["tests/test_unit.py"],
+          "UNIT TESTS (no API required)",
+          report="unit")
 
-    # ── AI Tests ─────────────────────────────────────────────
-    if args.ai or args.all:
-        k_filter = ["-k", "not Live"] if args.no_api else []
-        ok = run_pytest([
-            "tests/test_ai.py", "-v", "--tb=short",
-        ] + k_filter + [
-            "--html=reports/ai_report.html", "--self-contained-html"
-        ], "AI/ML TESTS — calidad, robustez, fairness, explicabilidad, drift")
-        results["AI/ML"] = ok
+    # -- AI (mostly no API) ------------------------------------------------
+    ai_extra = ["-k", "not live"] if args.no_api else []
+    suite(args.ai or args.all or args.no_api,
+          ["tests/test_ai.py"],
+          "AI/ML TESTS -- quality, robustness, fairness, drift",
+          extra=ai_extra, report="ai")
 
-    # ── Integration Tests ─────────────────────────────────────
-    if (args.integration or args.all or nothing_selected) and api_ok:
-        ok = run_pytest([
-            "tests/test_integration.py", "-v", "--tb=short",
-            "--html=reports/integration_report.html", "--self-contained-html"
-        ], "INTEGRATION TESTS — FastAPI ↔ Redis ↔ ML ↔ Prometheus")
-        results["Integration"] = ok
+    # -- Security ----------------------------------------------------------
+    suite(args.security or args.all or args.quick,
+          ["tests/test_security.py"],
+          "SECURITY TESTS -- Risk Score, auth, false positives, ML",
+          report="security")
 
-    # ── Security Tests ────────────────────────────────────────
-    if (args.security or args.all or nothing_selected) and api_ok:
-        ok = run_pytest([
-            "tests/test_security.py", "-v", "--tb=short",
-            "--html=reports/security_report.html", "--self-contained-html"
-        ], "SECURITY TESTS — Risk Score, autenticación, falsos positivos, ML")
-        results["Security"] = ok
+    # -- Advanced ----------------------------------------------------------
+    suite(args.advanced or args.all or args.quick,
+          ["tests/test_advanced.py"],
+          "ADVANCED TESTS -- API contract, chaos, concurrency, boundary",
+          report="advanced")
 
-    # ── Advanced Tests ────────────────────────────────────────
-    if (args.advanced or args.all or nothing_selected) and api_ok:
-        ok = run_pytest([
-            "tests/test_advanced.py", "-v", "--tb=short",
-            "--html=reports/advanced_report.html", "--self-contained-html"
-        ], "ADVANCED TESTS — contrato API, chaos, concurrencia, boundary values")
-        results["Advanced"] = ok
+    # -- Integration -------------------------------------------------------
+    suite(args.integration or args.all or args.quick,
+          ["tests/test_integration.py"],
+          "INTEGRATION TESTS -- FastAPI + Redis + ML + Prometheus",
+          report="integration")
 
-    # ── Penetration Tests ─────────────────────────────────────
-    if (args.pentest or args.all) and api_ok:
-        ok = run_pytest([
-            "tests/test_penetration.py", "-v", "-s", "--tb=short",
-            "--html=reports/pentest_report.html", "--self-contained-html"
-        ], "PENETRATION TESTS — SQL injection, XSS, fuerza bruta, evasión")
-        results["Penetration"] = ok
+    # -- Scraping ----------------------------------------------------------
+    suite(args.scraping or args.all,
+          ["tests/test_scraping.py"],
+          "SCRAPING TESTS -- /metrics format, labels, values, Prometheus",
+          report="scraping")
 
-    # ── Load Tests ────────────────────────────────────────────
-    if (args.load or args.all) and api_ok:
-        ok = run_pytest([
-            "tests/test_load.py", "-v", "-s", "--tb=short",
-            "-k", "not sustained",
-            "--html=reports/load_report.html", "--self-contained-html"
-        ], "LOAD TESTS — rendimiento, P99, concurrencia (sin test sostenido)")
-        results["Load"] = ok
+    # -- Penetration -------------------------------------------------------
+    suite(args.pentest or args.all,
+          ["tests/test_penetration.py"],
+          "PENETRATION TESTS -- SQL, XSS, brute force, evasion",
+          extra=["-s"], report="pentest")
 
-    # ── E2E Tests ─────────────────────────────────────────────
-    if (args.e2e or args.all) and api_ok:
-        ok = run_pytest([
-            "tests/test_e2e.py", "-v", "-s", "--tb=short",
-            "--html=reports/e2e_report.html", "--self-contained-html"
-        ], "E2E TESTS — journeys completos, Grafana, Prometheus, ML pipeline")
-        results["E2E"] = ok
+    # -- Load --------------------------------------------------------------
+    suite(args.load or args.all,
+          ["tests/test_load.py"],
+          "LOAD TESTS -- performance, concurrency, spike, soak",
+          extra=["-s"], report="load")
 
-    # ── Grafana data generation ───────────────────────────────
-    if args.grafana and api_ok:
-        ok = run_pytest([
-            "tests/test_security.py::TestLoadGeneration", "-v", "-s",
-        ], "GRAFANA DATA — generando tráfico para el dashboard")
-        results["Grafana Data"] = ok
+    # -- E2E ---------------------------------------------------------------
+    suite(args.e2e or args.all,
+          ["tests/test_e2e.py"],
+          "E2E TESTS -- full journeys, Prometheus, Grafana",
+          extra=["-s"], report="e2e")
 
-    # ── Summary ───────────────────────────────────────────────
-    elapsed = time.time() - start
-    print(f"\n{'═'*60}")
-    print(f"  RESUMEN FINAL  ({elapsed:.0f}s total)")
-    print(f"{'═'*60}")
+    # -- Grafana traffic generation ----------------------------------------
+    if args.grafana and api_ok and Path("tests/test_security.py").exists():
+        print(f"\n{C}Generating traffic for Grafana...{RS}")
+        run_pytest(
+            ["tests/test_security.py::TestLoadGeneration"],
+            "GRAFANA DATA -- mixed traffic to populate panels",
+            extra=["-s"],
+        )
+        print(f"  Open: {C}http://localhost:3000{RS}")
+
+    # -- Summary -----------------------------------------------------------
+    elapsed = time.time() - t0
+    print(f"\n{'=' * 60}")
+    print(f"{B}  SUMMARY  ({elapsed:.0f}s){RS}")
+    print(f"{'=' * 60}")
 
     all_passed = True
-    for suite, passed in results.items():
-        icon = "✅" if passed else "❌"
-        print(f"  {icon}  {suite}")
-        if not passed:
+    for name, passed in results.items():
+        if passed is None:
+            print(f"  {Y}SKIP{RS}  {name}")
+        elif passed:
+            print(f"  {G}PASS{RS}  {name}")
+        else:
+            print(f"  {R}FAIL{RS}  {name}")
             all_passed = False
 
     if results:
-        print(f"\n  📄 Reportes HTML en: reports/")
-        print(f"  📊 Grafana: http://localhost:3000")
+        print()
+        if args.report:
+            print(f"  Reports : {C}reports/{RS}")
+        print(f"  Grafana : {C}http://localhost:3000{RS}")
+        print(f"  Prometheus: {C}http://localhost:9090{RS}")
     print()
 
-    if all_passed:
-        print("  🎉 Todas las suites pasaron correctamente")
+    if not results:
+        print(f"{Y}No suites ran. Use --help to see options.{RS}")
+    elif all_passed:
+        print(f"{G}{B}All suites passed.{RS}")
     else:
-        print("  ⚠️  Algunas suites fallaron — revisa el output anterior")
+        print(f"{R}Some suites failed -- review output above.{RS}")
         sys.exit(1)
 
 
