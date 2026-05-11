@@ -137,7 +137,7 @@ def analyze_behavioral_ai(request: Request) -> float:
 async def security_middleware(request: Request, call_next):
 
     # Allow health checks and metrics without inspection
-    if request.url.path in ["/", "/metrics"]:
+    if request.url.path in ["/", "/metrics", "/status", "/openapi.json", "/docs", "/redoc"]:
         return await call_next(request)
 
     REQUESTS.labels(method=request.method, endpoint=request.url.path).inc()
