@@ -38,6 +38,7 @@ async def lifespan(app: FastAPI):
     # Startup
     load_model()
     RISK_SCORE_METRIC.labels(identifier="system_startup").set(0)
+    FALSE_POSITIVES.labels(identifier="system_startup").inc(0)  # pre-initialize so series exists in Prometheus
     LOGIN_FAILURES.labels(method="password", reason="none").inc(0)
     yield
     # Shutdown
@@ -137,11 +138,7 @@ def analyze_behavioral_ai(request: Request) -> float:
 async def security_middleware(request: Request, call_next):
 
     # Allow health checks and metrics without inspection
-<<<<<<< HEAD
     if request.url.path in ["/", "/metrics"]:
-=======
-    if request.url.path in ["/", "/metrics", "/status", "/openapi.json", "/docs", "/redoc"]:
->>>>>>> a0911aa1f82906fcb977a3175a4e7549874f9073
         return await call_next(request)
 
     REQUESTS.labels(method=request.method, endpoint=request.url.path).inc()
@@ -164,13 +161,10 @@ async def security_middleware(request: Request, call_next):
         BOT_PROBABILITY.labels(identifier=identifier).set(probability)
 
         if prediction == 1:
-<<<<<<< HEAD
-=======
-            # Check bypass header BEFORE blocking — same as rule-based branch
+            # Check if user is claiming to be legitimate before blocking
             if request.headers.get("X-Legitimate-User") == "true":
                 FALSE_POSITIVES.labels(identifier=identifier).inc()
                 return await call_next(request)
->>>>>>> a0911aa1f82906fcb977a3175a4e7549874f9073
             ML_BLOCKED.labels(identifier=identifier).inc()
             BLOCKED.labels(reason="ml_bot_detected", identifier=identifier).inc()
             return Response(
